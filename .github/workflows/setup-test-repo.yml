@@ -1,0 +1,41 @@
+name: Setup Test Repo (auto create)
+
+on:
+  workflow_dispatch:
+    inputs:
+      github_username:
+        description: 'GitHub username'
+        required: true
+      pat_token:
+        description: 'PAT (needs repo scope)'
+        required: true
+      repo_name:
+        description: 'New repo name'
+        required: true
+
+jobs:
+  create_repo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install gh
+        run: sudo apt-get update && sudo apt-get install -y gh
+
+      - name: Auth with token
+        run: echo "${{ github.event.inputs.pat_token }}" | gh auth login --with-token
+
+      - name: Create repo
+        run: |
+          gh repo create ${{ github.event.inputs.github_username }}/${{ github.event.inputs.repo_name }} --public --confirm
+
+      - name: Push workflows to new repo
+        run: |
+          git init
+          git config user.name "auto-bot"
+          git config user.email "bot@example.com"
+          git remote add origin https://${{ github.event.inputs.github_username }}:${{ github.event.inputs.pat_token }}@github.com/${{ github.event.inputs.github_username }}/${{ github.event.inputs.repo_name }}.git
+          git checkout -b main
+          mkdir -p .github/workflows
+          cp -r .github/workflows/* .github/workflows/
+          git add .
+          git commit -m "Initial commit with workflows"
+          git push origin main

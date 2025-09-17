@@ -1,0 +1,171 @@
+name: Build RK3399 Kernel (fixed defconfig)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: '内核分支（默认 develop-4.19）'
+        required: false
+        default: 'develop-4.19'
+      rootfs_url:
+        description: 'Rootfs URL (可选)'
+        required: false
+        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release/ubuntu-base-20.04.5-base-arm64.tar.gz'
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel_branch: [ ${{ github.event.inputs.kernel_branch }}, linux-4.19.y ]
+        sd_target: [ friendlydesktop-arm64, friendlycore-arm64 ]
+
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+
+    steps:
+      - name: Checkout repo (this workflows repo)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git build-essential bc bison flex libssl-dev libncurses-dev \
+            gcc-aarch64-linux-gnu device-tree-compiler u-boot-tools \
+            wget qemu-user-static xz-utils tar
+
+      - name: Clone rockchip kernel (branch: ${{ matrix.kernel_branch }})
+        run: |
+          set -e
+          # shallow clone the requested branch (fallback to full clone if shallow fails)
+          git clone --depth 1 --branch "${{ matrix.kernel_branch }}" https://github.com/rockchip-linux/kernel.git kernel-rockchip || git clone https://github.com/rockchip-linux/kernel.git kernel-rockchip
+          cd kernel-rockchip
+          git rev-parse --abbrev-ref HEAD || true
+        shell: bash
+
+      - name: Show available defconfigs (debug)
+        run: |
+          set -e
+          cd kernel-rockchip
+          echo "Listing arch/arm64/configs:"
+          ls -la arch/arm64/configs || true
+        shell: bash
+
+      - name: Choose defconfig (prefer rockchip_linux_defconfig)
+        run: |
+          set -e
+          cd kernel-rockchip
+          DEF=rockchip_linux_defconfig
+          if [ -f arch/arm64/configs/"$DEF" ]; then
+            echo "Using defconfig: $DEF"
+          else
+            echo "Preferred defconfig $DEF not found in arch/arm64/configs."
+            echo "Available configs:"
+            ls -la arch/arm64/configs || true
+            # try to find a suitable defconfig automatically (first matching *rockchip* or *rk3399*)
+            CAND=$(ls arch/arm64/configs | grep -Ei 'rockchip|rk3399' | head -n1 || true)
+            if [ -n "$CAND" ]; then
+              echo "Found candidate defconfig: $CAND"
+              DEF="$CAND"
+              echo "Will use $DEF"
+            else
+              echo "No suitable defconfig found. Please edit the workflow or add a defconfig to arch/arm64/configs."
+              exit 1
+            fi
+          fi
+          # export the defconfig name for next steps
+          echo "DEFCONFIG_NAME=$DEF" >> "$GITHUB_ENV" || true
+        shell: bash
+
+      - name: Apply patches if present
+        run: |
+          set -e
+          if [ -d patches ]; then
+            for p in patches/*.patch; do
+              [ -f "$p" ] || continue
+              echo "Applying $p"
+              git -C kernel-rockchip apply "$p" || patch -p1 -d kernel-rockchip < "$p"
+            done
+          else
+            echo "No patches/ directory found, skipping."
+          fi
+        shell: bash
+
+      - name: Build kernel (Image + dtbs)
+        run: |
+          set -e
+          cd kernel-rockchip
+          echo "Running: make ARCH=arm64 \${DEFCONFIG_NAME}"
+          make ARCH=arm64 "${DEFCONFIG_NAME}"
+          make -j$(nproc) ARCH=arm64 Image dtbs
+          mkdir -p ../artifacts_kernel
+          cp -v arch/arm64/boot/Image ../artifacts_kernel/ || true
+          find arch/arm64/boot/dts -name '*.dtb' -exec cp -v {} ../artifacts_kernel/ \; || true
+          echo "Kernel build complete, artifacts in ../artifacts_kernel"
+        shell: bash
+
+      - name: (optional) Build U-Boot and prepare loaders
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/u-boot/u-boot.git u-boot || git clone https://github.com/u-boot/u-boot.git u-boot
+          cd u-boot
+          # nanopc-t4/u-boot configs vary; this is a best-effort build for u-boot (may need board-specific defconfig)
+          if make help | grep -q nanopc; then
+            make nanopc_t4_defconfig || true
+          else
+            make CROSS_COMPILE=aarch64-linux-gnu- defconfig || true
+          fi
+          make -j$(nproc) CROSS_COMPILE=aarch64-linux-gnu- || true
+          mkdir -p ../artifacts_uboot
+          cp -v u-boot.bin u-boot.itb spl/u-boot-spl.bin ../artifacts_uboot/ || true
+        shell: bash
+
+      - name: Clone sd-fuse_rk3399 and prepare target
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/friendlyarm/sd-fuse_rk3399.git sd-fuse_rk3399 || true
+          SDT="sd-fuse_rk3399/${{ matrix.sd_target }}"
+          mkdir -p "$SDT"/Image
+          # copy kernel artifacts if exist
+          cp -v artifacts_kernel/Image "$SDT"/Image/kernel.img || true
+          cp -v artifacts_kernel/*.dtb "$SDT"/Image/ || true
+          # copy u-boot artifacts if exist
+          cp -v artifacts_uboot/* "$SDT"/Image/ || true
+        shell: bash
+
+      - name: Attempt mk-sd-image.sh (generate out/*.img)
+        run: |
+          set -e
+          cd sd-fuse_rk3399
+          chmod +x mk-sd-image.sh || true
+          # Best-effort - mk-sd-image should produce out/ images without using physical devices
+          ./mk-sd-image.sh "${{ matrix.sd_target }}" || echo "mk-sd-image.sh returned non-zero (continue to collect artifacts)"
+          mkdir -p ../artifacts_sd/${{ matrix.kernel_branch }}_${{ matrix.sd_target }}
+          cp -v out/* ../artifacts_sd/${{ matrix.kernel_branch }}_${{ matrix.sd_target }}/ || true
+        shell: bash
+
+      - name: List artifacts
+        run: |
+          echo "Kernel artifacts:"
+          ls -la artifacts_kernel || true
+          echo "U-Boot artifacts:"
+          ls -la artifacts_uboot || true
+          echo "SD artifacts:"
+          ls -la artifacts_sd || true
+        shell: bash
+
+      - name: Upload artifacts (only on success)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rk3399-${{ matrix.kernel_branch }}-${{ matrix.sd_target }}
+          path: |
+            artifacts_kernel/
+            artifacts_uboot/
+            artifacts_sd/
