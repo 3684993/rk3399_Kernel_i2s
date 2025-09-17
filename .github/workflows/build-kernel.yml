@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       kernel_branch:
-        description: '内核分支（默认 develop-4.19）'
+        description: '可选：只运行指定内核分支（留空表示运行 matrix 中所有）'
         required: false
-        default: 'develop-4.19'
+        default: ''
       rootfs_url:
         description: 'Rootfs URL (可选)'
         required: false
@@ -20,7 +20,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel_branch: [ ${{ github.event.inputs.kernel_branch }}, linux-4.19.y ]
+        # 静态矩阵：若需添加其它分支/target 在这里扩展
+        kernel_branch: [ develop-4.19, linux-4.19.y ]
         sd_target: [ friendlydesktop-arm64, friendlycore-arm64 ]
 
     env:
@@ -28,135 +29,185 @@ jobs:
       CROSS_COMPILE: aarch64-linux-gnu-
 
     steps:
-      - name: Checkout repo (this workflows repo)
+      - name: Checkout this repo
         uses: actions/checkout@v4
 
-      - name: Install build deps
+      - name: Maybe skip this matrix job if kernel_branch input was provided and doesn't match
+        # 当输入 kernel_branch 非空且不等于当前 matrix.kernel_branch 时直接退出（成功），从而只保留与输入匹配的 job 运行
         run: |
-          set -e
+          # github.event.inputs.kernel_branch 被展开成字符串（可能为空）
+          INPUT_BRANCH="${{ github.event.inputs.kernel_branch }}"
+          MATRIX_BRANCH="${{ matrix.kernel_branch }}"
+          if [ -n "$INPUT_BRANCH" ] && [ "$INPUT_BRANCH" != "$MATRIX_BRANCH" ]; then
+            echo "Input kernel_branch='$INPUT_BRANCH' provided; skipping matrix job for kernel_branch='$MATRIX_BRANCH'."
+            exit 0
+          fi
+          echo "Proceeding with kernel_branch=${MATRIX_BRANCH}"
+        shell: bash
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             git build-essential bc bison flex libssl-dev libncurses-dev \
             gcc-aarch64-linux-gnu device-tree-compiler u-boot-tools \
-            wget qemu-user-static xz-utils tar
-
-      - name: Clone rockchip kernel (branch: ${{ matrix.kernel_branch }})
-        run: |
-          set -e
-          # shallow clone the requested branch (fallback to full clone if shallow fails)
-          git clone --depth 1 --branch "${{ matrix.kernel_branch }}" https://github.com/rockchip-linux/kernel.git kernel-rockchip || git clone https://github.com/rockchip-linux/kernel.git kernel-rockchip
-          cd kernel-rockchip
-          git rev-parse --abbrev-ref HEAD || true
+            wget qemu-user-static xz-utils tar pkg-config python3 python3-pip
         shell: bash
 
-      - name: Show available defconfigs (debug)
+      - name: Clone Rockchip kernel (requested branch) and apply patches
         run: |
-          set -e
-          cd kernel-rockchip
-          echo "Listing arch/arm64/configs:"
-          ls -la arch/arm64/configs || true
-        shell: bash
-
-      - name: Choose defconfig (prefer rockchip_linux_defconfig)
-        run: |
-          set -e
-          cd kernel-rockchip
-          DEF=rockchip_linux_defconfig
-          if [ -f arch/arm64/configs/"$DEF" ]; then
-            echo "Using defconfig: $DEF"
+          set -euo pipefail
+          KB="${{ matrix.kernel_branch }}"
+          echo "Cloning rockchip-linux/kernel (branch: $KB)..."
+          # 尝试浅克隆目标分支，若失败则做完整克隆
+          if git ls-remote --exit-code --heads https://github.com/rockchip-linux/kernel.git "$KB" >/dev/null 2>&1; then
+            git clone --depth 1 --branch "$KB" https://github.com/rockchip-linux/kernel.git kernel-rockchip
           else
-            echo "Preferred defconfig $DEF not found in arch/arm64/configs."
-            echo "Available configs:"
-            ls -la arch/arm64/configs || true
-            # try to find a suitable defconfig automatically (first matching *rockchip* or *rk3399*)
-            CAND=$(ls arch/arm64/configs | grep -Ei 'rockchip|rk3399' | head -n1 || true)
-            if [ -n "$CAND" ]; then
-              echo "Found candidate defconfig: $CAND"
-              DEF="$CAND"
-              echo "Will use $DEF"
+            git clone https://github.com/rockchip-linux/kernel.git kernel-rockchip
+            cd kernel-rockchip
+            if git rev-parse --verify --quiet "origin/$KB" >/dev/null 2>&1; then
+              git fetch origin "$KB" --depth 1 || true
+              git checkout -B "$KB" "origin/$KB" || true
             else
-              echo "No suitable defconfig found. Please edit the workflow or add a defconfig to arch/arm64/configs."
-              exit 1
+              echo "Warning: branch $KB not found on remote; staying on default branch."
             fi
+            cd -
           fi
-          # export the defconfig name for next steps
-          echo "DEFCONFIG_NAME=$DEF" >> "$GITHUB_ENV" || true
-        shell: bash
 
-      - name: Apply patches if present
-        run: |
-          set -e
+          # 应用仓库根目录 patches/ 下的补丁（如果存在）
           if [ -d patches ]; then
             for p in patches/*.patch; do
               [ -f "$p" ] || continue
-              echo "Applying $p"
-              git -C kernel-rockchip apply "$p" || patch -p1 -d kernel-rockchip < "$p"
+              echo "Applying patch: $p"
+              git -C kernel-rockchip apply "$p" || ( echo "git apply failed, try patch -p1" && patch -p1 -d kernel-rockchip < "$p" ) || true
             done
           else
-            echo "No patches/ directory found, skipping."
+            echo "No patches/ directory found; skipping patch application."
           fi
+
+          echo "Kernel repo prepared."
         shell: bash
 
-      - name: Build kernel (Image + dtbs)
+      - name: Show available defconfigs and select defconfig (prefer rockchip_linux_defconfig)
         run: |
-          set -e
+          set -euo pipefail
           cd kernel-rockchip
-          echo "Running: make ARCH=arm64 \${DEFCONFIG_NAME}"
-          make ARCH=arm64 "${DEFCONFIG_NAME}"
+          echo "Listing arch/arm64/configs:"
+          ls -la arch/arm64/configs || true
+
+          PREFERRED="rockchip_linux_defconfig"
+          if [ -f arch/arm64/configs/${PREFERRED} ]; then
+            DEF="${PREFERRED}"
+            echo "Using preferred defconfig: ${DEF}"
+          else
+            # 尝试自动寻找合适候选
+            CAND=$(ls arch/arm64/configs | grep -Ei 'rockchip|rk3399|nanopct4|nanopc' | head -n1 || true)
+            if [ -n "$CAND" ]; then
+              DEF="$CAND"
+              echo "Preferred defconfig not found. Using candidate: ${DEF}"
+            else
+              echo "No rockchip/rk3399 defconfig found in arch/arm64/configs. Please check kernel branch or add a defconfig."
+              echo "Available files:"
+              ls -la arch/arm64/configs || true
+              exit 1
+            fi
+          fi
+
+          # 导出到临时文件供随后的步骤使用（也可直接在后续步骤重复逻辑）
+          echo "SELECTED_DEFCONFIG=${DEF}" > /tmp/selected_defconfig.txt
+          echo "Selected defconfig: ${DEF}"
+        shell: bash
+
+      - name: Build kernel Image + dtbs
+        run: |
+          set -euo pipefail
+          cd kernel-rockchip
+          DEF=$(cat /tmp/selected_defconfig.txt | sed -n 's/SELECTED_DEFCONFIG=//p')
+          echo "Running make ${DEF}"
+          make ARCH=arm64 "${DEF}"
+          echo "Building Image and dtbs..."
           make -j$(nproc) ARCH=arm64 Image dtbs
           mkdir -p ../artifacts_kernel
           cp -v arch/arm64/boot/Image ../artifacts_kernel/ || true
-          find arch/arm64/boot/dts -name '*.dtb' -exec cp -v {} ../artifacts_kernel/ \; || true
-          echo "Kernel build complete, artifacts in ../artifacts_kernel"
+          # 收集 dtb（可能分散在 arch/arm64/boot/dts 或子目录）
+          find arch/arm64/boot -type f -name '*.dtb' -exec cp -v {} ../artifacts_kernel/ \; || true
+          echo "Kernel build finished. Artifacts saved to ../artifacts_kernel"
         shell: bash
 
-      - name: (optional) Build U-Boot and prepare loaders
+      - name: Build U-Boot (best-effort)
         run: |
-          set -e
+          set -euo pipefail
+          echo "Cloning u-boot..."
           git clone --depth 1 https://github.com/u-boot/u-boot.git u-boot || git clone https://github.com/u-boot/u-boot.git u-boot
           cd u-boot
-          # nanopc-t4/u-boot configs vary; this is a best-effort build for u-boot (may need board-specific defconfig)
-          if make help | grep -q nanopc; then
-            make nanopc_t4_defconfig || true
-          else
+
+          # 尝试常见 RK3399 / NanoPC-T4 的 defconfig 名称
+          if make listconfigs 2>/dev/null | grep -iq 'nanopc'; then
+            echo "Found nanopc-related configs; trying nanopc_t4_defconfig / nanopct4_defconfig..."
+            (make nanopc_t4_defconfig CROSS_COMPILE=aarch64-linux-gnu- || true)
+            (make nanopct4_defconfig CROSS_COMPILE=aarch64-linux-gnu- || true)
+          fi
+
+          # fallback to a generic defconfig if board-specific not present
+          if [ ! -f include/configs/nanopct4.h ] && [ ! -f include/configs/nanopc_t4.h ]; then
+            echo "Board-specific defconfig not found; using default defconfig (best-effort)."
             make CROSS_COMPILE=aarch64-linux-gnu- defconfig || true
           fi
+
+          echo "Building u-boot (may fail for missing board config) ..."
           make -j$(nproc) CROSS_COMPILE=aarch64-linux-gnu- || true
+
           mkdir -p ../artifacts_uboot
-          cp -v u-boot.bin u-boot.itb spl/u-boot-spl.bin ../artifacts_uboot/ || true
+          cp -v u-boot.bin u-boot.itb spl/u-boot-spl.bin ../artifacts_uboot/ 2>/dev/null || true
+          echo "U-Boot build step completed (artifacts, if any, in ../artifacts_uboot)."
         shell: bash
 
-      - name: Clone sd-fuse_rk3399 and prepare target
+      - name: Prepare sd-fuse target and copy artifacts
         run: |
-          set -e
+          set -euo pipefail
           git clone --depth 1 https://github.com/friendlyarm/sd-fuse_rk3399.git sd-fuse_rk3399 || true
           SDT="sd-fuse_rk3399/${{ matrix.sd_target }}"
-          mkdir -p "$SDT"/Image
-          # copy kernel artifacts if exist
-          cp -v artifacts_kernel/Image "$SDT"/Image/kernel.img || true
-          cp -v artifacts_kernel/*.dtb "$SDT"/Image/ || true
-          # copy u-boot artifacts if exist
-          cp -v artifacts_uboot/* "$SDT"/Image/ || true
+          mkdir -p "${SDT}/Image"
+          # copy kernel artifacts
+          cp -v artifacts_kernel/Image "${SDT}/Image/kernel.img" || true
+          cp -v artifacts_kernel/*.dtb "${SDT}/Image/" || true
+          # copy u-boot artifacts (if exist)
+          cp -v artifacts_uboot/* "${SDT}/Image/" || true
+          echo "Prepared sd-fuse target at ${SDT}"
         shell: bash
 
-      - name: Attempt mk-sd-image.sh (generate out/*.img)
+      - name: Try download prebuilt loader/trust (best-effort)
         run: |
-          set -e
-          cd sd-fuse_rk3399
+          set -euo pipefail
+          SDT="sd-fuse_rk3399/${{ matrix.sd_target }}"
+          # 尝试从 sd-fuse 仓库常见路径取预置文件（仅示例，若无则容错）
+          MINI_URL="https://raw.githubusercontent.com/friendlyarm/sd-fuse_rk3399/master/prebuilt/MiniLoaderAll.bin"
+          TRUST_URL="https://raw.githubusercontent.com/friendlyarm/sd-fuse_rk3399/master/prebuilt/trust.img"
+          mkdir -p "${SDT}/Image"
+          echo "Attempting to download MiniLoaderAll.bin and trust.img (best-effort)..."
+          wget -q -O "${SDT}/Image/MiniLoaderAll.bin" "${MINI_URL}" || echo "MiniLoaderAll.bin not found at ${MINI_URL}"
+          wget -q -O "${SDT}/Image/trust.img" "${TRUST_URL}" || echo "trust.img not found at ${TRUST_URL}"
+        shell: bash
+
+      - name: Run mk-sd-image.sh to generate out/*.img (best-effort)
+        run: |
+          set -euo pipefail
+          cd sd-fuse_rk3399 || { echo "sd-fuse_rk3399 directory missing"; exit 0; }
           chmod +x mk-sd-image.sh || true
-          # Best-effort - mk-sd-image should produce out/ images without using physical devices
-          ./mk-sd-image.sh "${{ matrix.sd_target }}" || echo "mk-sd-image.sh returned non-zero (continue to collect artifacts)"
+          echo "Running mk-sd-image.sh for target ${{ matrix.sd_target }} (may require loop device -- best-effort in Actions)..."
+          ./mk-sd-image.sh "${{ matrix.sd_target }}" || echo "mk-sd-image.sh returned non-zero (continuing to collect artifacts)."
           mkdir -p ../artifacts_sd/${{ matrix.kernel_branch }}_${{ matrix.sd_target }}
-          cp -v out/* ../artifacts_sd/${{ matrix.kernel_branch }}_${{ matrix.sd_target }}/ || true
+          cp -v out/* ../artifacts_sd/${{ matrix.kernel_branch }}_${{ matrix.sd_target }}/ 2>/dev/null || true
         shell: bash
 
-      - name: List artifacts
+      - name: List and upload artifacts (if present)
         run: |
-          echo "Kernel artifacts:"
+          echo "=== Kernel artifacts ==="
           ls -la artifacts_kernel || true
-          echo "U-Boot artifacts:"
+          echo "=== U-Boot artifacts ==="
           ls -la artifacts_uboot || true
-          echo "SD artifacts:"
+          echo "=== SD images ==="
           ls -la artifacts_sd || true
         shell: bash
 
@@ -169,3 +220,4 @@ jobs:
             artifacts_kernel/
             artifacts_uboot/
             artifacts_sd/
+
